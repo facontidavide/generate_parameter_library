@@ -394,6 +394,196 @@ def test_unused_definitions_are_reported_and_not_parsed(workspace, definition):
     assert 'broken.yaml' in diagnostics[0].message
 
 
+def test_wildcard_only_config_is_validated(workspace, definition):
+    """A file whose only section is the wildcard still describes a node."""
+    config = write(
+        workspace,
+        'config.yaml',
+        """/**:
+  ros__parameters:
+    rate: -1.0
+    mandatory_gain: 1.5
+""",
+    )
+    found = errors(validate([definition], [config]))
+    assert len(found) == 1
+    assert 'rate' in found[0].location
+
+
+def test_none_typed_parameters_are_left_alone(workspace):
+    """A parameter of type none is declared by other code, not by the node."""
+    definition = write(
+        workspace,
+        'none.yaml',
+        """external_node:
+  some_parameter:
+    type: string
+    default_value: "hello"
+  some_external_parameter:
+    type: none
+""",
+    )
+    config = write(
+        workspace,
+        'config.yaml',
+        """external_node:
+  ros__parameters:
+    some_parameter: "hello"
+    some_external_parameter:
+      filter1:
+        type: "LowPass"
+""",
+    )
+    assert validate([definition], [config], strict=True) == []
+
+
+def test_mapped_keys_fall_back_to_the_declared_default(workspace):
+    """The node expands a map over the effective key list, so the tool must."""
+    definition = write(workspace, 'mapped.yaml', MAPPED_DEFINITION)
+    config = write(
+        workspace,
+        'config.yaml',
+        """mapped_node:
+  ros__parameters:
+    pid:
+      shoulder:
+        p: -2.0
+      elbow:
+        p: 3.0
+""",
+    )
+    found = errors(validate([definition], [config], strict=True))
+    assert len(found) == 1
+    assert found[0].location == 'mapped_node.pid.shoulder.p'
+
+
+def test_node_name_with_namespace_or_leading_slash_matches(workspace, definition):
+    """A section may carry a leading slash or a namespace; a definition cannot."""
+    other = write(workspace, 'other.yaml', MAPPED_DEFINITION)
+    shapes = {
+        'leading slash': (
+            '/my_node:\n'
+            '  ros__parameters:\n'
+            '    rate: -5.0\n'
+            '    mandatory_gain: 1.5\n'
+        ),
+        'namespace': (
+            'my_ns:\n'
+            '  my_node:\n'
+            '    ros__parameters:\n'
+            '      rate: -5.0\n'
+            '      mandatory_gain: 1.5\n'
+        ),
+    }
+    for shape, text in shapes.items():
+        config = write(workspace, 'config.yaml', text)
+        found = errors(validate([definition, other], [config]))
+        assert len(found) == 1, shape
+        assert 'rate' in found[0].location, shape
+
+
+def test_built_in_parameters_are_not_unknown(workspace, definition):
+    config = write(
+        workspace,
+        'config.yaml',
+        """/**:
+  ros__parameters:
+    use_sim_time: true
+    mandatory_gain: 1.5
+my_node:
+  ros__parameters:
+    rate: 5.0
+""",
+    )
+    assert errors(validate([definition], [config], strict=True)) == []
+
+
+def test_scientific_notation_is_a_double(workspace, definition):
+    """ROS 2 reads 1e5 as a double even though PyYAML calls it a string."""
+    config = write(
+        workspace,
+        'config.yaml',
+        """my_node:
+  ros__parameters:
+    rate: 1e5
+    mandatory_gain: 1e-3
+""",
+    )
+    assert validate([definition], [config]) == []
+
+
+def test_word_that_ros_reads_as_a_bool_is_reported(workspace, definition):
+    """The loader drops the quoting style, so this can only be a warning."""
+    config = write(
+        workspace,
+        'config.yaml',
+        'my_node:\n  ros__parameters:\n    mandatory_gain: 1.5\n    name: y\n',
+    )
+    diagnostics = validate([definition], [config])
+    assert errors(diagnostics) == []
+    assert any('reads y as a bool' in d.message for d in diagnostics)
+
+
+def test_empty_array_is_reported(workspace, definition):
+    """ROS 2 cannot type an empty sequence and leaves the parameter unset."""
+    config = write(
+        workspace,
+        'config.yaml',
+        """my_node:
+  ros__parameters:
+    mandatory_gain: 1.5
+    joints: []
+""",
+    )
+    found = errors(validate([definition], [config]))
+    assert len(found) == 1
+    assert 'PARAMETER_NOT_SET' in found[0].message
+
+
+def test_duplicate_namespace_is_reported(workspace, definition):
+    twin = write(
+        workspace,
+        'twin.yaml',
+        """my_node:
+  something_else:
+    type: int
+    default_value: 1
+""",
+    )
+    config = write(
+        workspace,
+        'config.yaml',
+        """my_node:
+  ros__parameters:
+    mandatory_gain: 1.5
+""",
+    )
+    found = errors(validate([definition, twin], [config]))
+    assert any('declared by both' in d.message for d in found)
+
+
+def test_one_definition_does_not_claim_unrelated_sections(workspace, definition):
+    config = write(
+        workspace,
+        'config.yaml',
+        """my_node:
+  ros__parameters:
+    mandatory_gain: 1.5
+some_other_node:
+  ros__parameters:
+    completely: "different"
+""",
+    )
+    diagnostics = validate([definition], [config])
+    assert errors(diagnostics) == []
+    assert any('not checked' in d.message for d in diagnostics)
+
+
+def test_missing_file_is_reported_without_a_traceback(workspace, definition):
+    code = main(['--param-definition', definition, '--config', '/no/such/config.yaml'])
+    assert code == 1
+
+
 def test_main_returns_non_zero_on_error(workspace, definition):
     config = write(
         workspace,
