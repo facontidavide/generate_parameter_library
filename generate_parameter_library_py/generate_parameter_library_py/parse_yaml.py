@@ -238,6 +238,8 @@ class CodeGenVariableBase:
         self.name = name
         self.param_name = param_name
         self.defined_type, template = self.process_type(defined_type)
+        # Size of a fixed size type, None for every other type.
+        self.fixed_size = template[1] if template is not None else None
         self.array_type = array_type(self.defined_type)
 
         if self.defined_type not in self.conversion.defined_type_to_lang_type:
