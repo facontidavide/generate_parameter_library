@@ -36,8 +36,10 @@ it can be used as a CI step or by anyone who configures a robot from a laptop.
 
 import argparse
 import difflib
+import os
 import sys
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
 
@@ -50,14 +52,17 @@ WILDCARD_NODE = '/**'
 ERROR = 'ERROR'
 WARNING = 'WARNING'
 
+# Most unknown parameters for which a 'did you mean' suggestion is computed.
+MAX_SUGGESTIONS = 10
 
+
+@dataclass
 class Diagnostic:
     """One finding, printed as a single line."""
 
-    def __init__(self, severity: str, location: str, message: str):
-        self.severity = severity
-        self.location = location
-        self.message = message
+    severity: str
+    location: str
+    message: str
 
     def __str__(self):
         return f'{self.severity}: {self.location}: {self.message}'
@@ -77,13 +82,11 @@ class DeclaredParameter:
     def __init__(self, declaration, name: Optional[str] = None):
         variable = declaration.code_gen_variable
         self.name = name if name is not None else variable.param_name
-        self.defined_type = variable.defined_type
         self.scalar_type = variable.defined_base_type
         self.is_array = variable.array_type
         self.fixed_size = variable.fixed_size
         self.default_value = variable.default_value
         self.validations = declaration.parameter_validations
-        self.read_only = declaration.parameter_read_only
 
     @property
     def has_default(self) -> bool:
@@ -143,35 +146,54 @@ def check_type(parameter: DeclaredParameter, value: Any) -> Optional[str]:
     return None
 
 
-def run_validations(parameter: DeclaredParameter, value: Any) -> List[str]:
-    """Replay the definition's validators, skipping the ones needing C++."""
-    messages = []
+def run_validations(parameter: DeclaredParameter, value: Any) -> List[Tuple[str, str]]:
+    """Replay the definition's validators and return (severity, message) pairs.
+
+    A validator that rejects the value is an error. A validator that cannot run
+    here, because it is written in C++ or because it raised, is a warning: the
+    value may well be correct and only the check is missing.
+    """
+    results = []
     for validation in parameter.validations:
         name = validation.function_base_name
         function = getattr(ParameterValidators, name, None)
         if function is None:
-            messages.append(
-                f'custom validator {validation.function_name} cannot be evaluated '
-                f'without building the node, skipped'
+            results.append(
+                (
+                    WARNING,
+                    f'custom validator {validation.function_name} is C++ and '
+                    f'cannot be evaluated here, not checked',
+                )
             )
             continue
         try:
             result = function(
                 _ValidatorParam(parameter.name, value), *validation.arguments
             )
-        except (TypeError, AttributeError) as error:
-            messages.append(f'validator {name} could not be evaluated: {error}')
+        except Exception as error:  # noqa: BLE001 - a validator must not stop the run
+            results.append(
+                (
+                    WARNING,
+                    f'validator {name} raised {type(error).__name__}: {error}, '
+                    f'not checked',
+                )
+            )
             continue
         if result:
-            messages.append(result)
-    return messages
+            results.append((ERROR, result))
+    return results
+
+
+def join_name(prefix: str, part: Any) -> str:
+    """Join a dotted parameter name, tolerating an empty prefix."""
+    return f'{prefix}.{part}' if prefix else str(part)
 
 
 def flatten(tree: Dict, prefix: str = '') -> Dict[str, Any]:
     """Flatten a nested mapping into dotted names."""
     flat = {}
     for key, value in tree.items():
-        name = f'{prefix}.{key}' if prefix else str(key)
+        name = join_name(prefix, key)
         if isinstance(value, dict):
             flat.update(flatten(value, name))
         else:
@@ -197,11 +219,9 @@ def expand_mapped_name(
             index += 1
             if not isinstance(keys, list):
                 return None
-            names = [
-                f'{base}.{key}' if base else str(key) for base in names for key in keys
-            ]
+            names = [join_name(base, key) for base in names for key in keys]
         else:
-            names = [f'{base}.{segment}' if base else segment for base in names]
+            names = [join_name(base, segment) for base in names]
     return names
 
 
@@ -210,6 +230,43 @@ def load_definition(path: str):
     generator = GenerateCode('markdown')
     generator.parse(path, '')
     return generator
+
+
+def definition_namespace(path: str) -> Optional[str]:
+    """Read the root element of a definition without parsing its parameters.
+
+    Returns None when the file does not have exactly one root element, so that
+    the caller parses it and reports the error the parser raises.
+    """
+    document = load_yaml(path)
+    keys = list(document)
+    return keys[0] if len(keys) == 1 else None
+
+
+def load_definitions(
+    paths: List[str], used: Set[str]
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Parse the definitions whose namespace a configuration actually uses.
+
+    Parsing a definition runs the same per parameter work as code generation, so
+    with many definitions on the command line only the ones a configuration
+    refers to are parsed. A single definition is always parsed, because it is
+    applied to every section. Returns the parsed definitions and the paths that
+    were left out, which the caller reports so that skipping stays visible.
+    """
+    if len(paths) == 1:
+        generator = load_definition(paths[0])
+        return {generator.namespace: generator}, []
+    generators = {}
+    unused = []
+    for path in paths:
+        namespace = definition_namespace(path)
+        if namespace is None or namespace in used:
+            generator = load_definition(path)
+            generators[generator.namespace] = generator
+        else:
+            unused.append(path)
+    return generators, unused
 
 
 def declared_parameters(
@@ -263,7 +320,7 @@ def validate_section(
     parameters = declared_parameters(generator, values)
 
     for name, parameter in sorted(parameters.items()):
-        where = f'{location}.{name}' if location else name
+        where = join_name(location, name)
         if name not in values:
             if not parameter.has_default:
                 diagnostics.append(
@@ -290,16 +347,23 @@ def validate_section(
         if problem is not None:
             diagnostics.append(Diagnostic(ERROR, where, problem))
             continue
-        for message in run_validations(parameter, value):
-            severity = WARNING if 'cannot be evaluated' in message else ERROR
+        for severity, message in run_validations(parameter, value):
             diagnostics.append(Diagnostic(severity, where, message))
 
     if strict:
-        for name in sorted(values):
-            if name in parameters:
-                continue
-            where = f'{location}.{name}' if location else name
-            close = difflib.get_close_matches(name, parameters.keys(), n=1)
+        unknown = [name for name in sorted(values) if name not in parameters]
+        # Every suggestion compares the name against every declared parameter, so
+        # they are only worth computing while there are few names to suggest for.
+        # A configuration that has drifted wholesale is not helped by a list of
+        # guesses anyway.
+        suggest = len(unknown) <= MAX_SUGGESTIONS
+        for name in unknown:
+            where = join_name(location, name)
+            close = (
+                difflib.get_close_matches(name, parameters.keys(), n=1)
+                if suggest
+                else []
+            )
             hint = f" (did you mean '{close[0]}'?)" if close else ''
             diagnostics.append(Diagnostic(ERROR, where, f'unknown parameter{hint}'))
 
@@ -319,21 +383,31 @@ def validate(
 ) -> List[Diagnostic]:
     """Validate every config against the definitions whose namespace matches."""
     diagnostics = []
-    definitions = {}
-    for path in definition_paths:
-        generator = load_definition(path)
-        definitions[generator.namespace] = generator
+    configs = [(path, node_sections(load_yaml(path))) for path in config_paths]
+    used = {name for _, sections in configs for name in sections}
+    definitions, unused = load_definitions(definition_paths, used)
+    single_definition = len(definition_paths) == 1
+    if unused:
+        shown = ', '.join(os.path.basename(path) for path in unused[:5])
+        if len(unused) > 5:
+            shown += f' and {len(unused) - 5} more'
+        diagnostics.append(
+            Diagnostic(
+                WARNING,
+                'parameter definitions',
+                f'{len(unused)} matched no configuration section and were not '
+                f'checked: {shown}',
+            )
+        )
 
-    for config_path in config_paths:
-        document = load_yaml(config_path)
-        sections = node_sections(document)
+    for config_path, sections in configs:
         wildcard = flatten(sections.pop(WILDCARD_NODE, {}))
         for node_name, tree in sections.items():
             values = dict(wildcard)
             values.update(flatten(tree))
             if node_name in definitions:
                 generator = definitions[node_name]
-            elif len(definitions) == 1:
+            elif single_definition:
                 generator = next(iter(definitions.values()))
             else:
                 diagnostics.append(
